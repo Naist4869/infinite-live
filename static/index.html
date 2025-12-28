@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>InfiniteLive (LiveKit)</title>
+    <!-- 引入 LiveKit SDK -->
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+    <style>
+        /* 样式保持不变，省略以节省空间 */
+        body { font-family: sans-serif; background: #121212; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        #video-container { width: 512px; height: 768px; background: #000; overflow: hidden; }
+        video { width: 100%; height: 100%; object-fit: cover; }
+        .controls { margin-top: 20px; display: flex; gap: 10px; }
+    </style>
+</head>
+<body>
+<h1>InfiniteLive</h1>
+<div id="video-container">
+    <!-- LiveKit 通常会自动创建 audio/video 元素，或者我们可以指定 -->
+    <video id="remoteVideo" autoplay playsinline></video>
+    <audio id="remoteAudio" autoplay></audio>
+</div>
+
+<div class="controls" id="startControls">
+    <button id="startBtn" onclick="startConference()">Connect to Room</button>
+</div>
+
+<div class="controls" id="chatControls" style="display: none;">
+    <input type="text" id="commentInput" placeholder="Say something...">
+    <button id="sendBtn" onclick="sendComment()">Send</button>
+</div>
+
+<script>
+    const LIVEKIT_URL = "ws://172.25.51.50:7880";
+    let room;
+
+    async function startConference() {
+        document.getElementById('startBtn').disabled = true;
+
+        // 在真实应用中，Token 应该从你的后端 API 获取
+        // 这里为了演示方便，假设你有一个生成 Token 的后端接口或者手动填入
+        // 为了跑通 Demo，你需要写一个临时的 /token 接口，或者硬编码一个长效 Token
+        const token = await getToken();
+
+        room = new LivekitClient.Room({
+            adaptiveStream: true,
+            dynacast: true,
+        });
+
+        // 订阅轨道处理
+        room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+            console.log("Track Subscribed:", track.kind);
+            if (track.kind === LivekitClient.Track.Kind.Video) {
+                const videoEl = document.getElementById('remoteVideo');
+                track.attach(videoEl);
+            } else if (track.kind === LivekitClient.Track.Kind.Audio) {
+                const audioEl = document.getElementById('remoteAudio');
+                track.attach(audioEl);
+            }
+        });
+
+        try {
+            await room.connect(LIVEKIT_URL, token);
+            console.log('Connected to room', room.name);
+
+            document.getElementById('startControls').style.display = 'none';
+            document.getElementById('chatControls').style.display = 'flex';
+        } catch (e) {
+            console.error('Failed to connect', e);
+            document.getElementById('startBtn').disabled = false;
+        }
+    }
+
+    async function getToken() {
+        // 这里请求你的后端获取 Token
+        // 简单的后端实现见下文补充
+        const resp = await fetch('/token');
+        const data = await resp.json();
+        return data.token;
+    }
+
+    async function sendComment() {
+        const input = document.getElementById('commentInput');
+        const text = input.value;
+        if (!text) return;
+        input.value = '';
+
+        // 依然使用 HTTP 接口发送评论，或者改用 LiveKit DataChannel
+        await fetch('/comment', { method: 'POST', body: text });
+        console.log("Sent comment:", text);
+    }
+</script>
+</body>
+</html>
