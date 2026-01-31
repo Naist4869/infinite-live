@@ -7,27 +7,30 @@ import (
 )
 
 const (
-	PacketTypeVideo     = 0x01
-	PacketTypeAudio     = 0x02
-	PacketTypeText      = 0x03
-	PacketTypeUserAudio = 0x04 // <--- 新增这个：代表用户说话的音频
-
+	PacketTypeVideo     = 0x02 // 保持和 Python 习惯一致，或者强行统一为 1
+	PacketTypeAudio     = 0x03
+	PacketTypeText      = 0x01
+	PacketTypeUserAudio = 0x04
 )
 
 // WritePacket writes a type-prefixed, length-prefixed packet
 // Format: [Type:1][Length:4][Payload:N]
 func WritePacket(w io.Writer, packetType byte, data []byte) error {
 	length := uint32(len(data))
-	header := make([]byte, 5) // 1 byte type + 4 bytes length
-	header[0] = packetType
-	binary.BigEndian.PutUint32(header[1:], length)
 
-	// Write header
-	if _, err := w.Write(header); err != nil {
-		return err
+	// 🔥 优化：一次性分配内存，合并 Header 和 Payload
+	// 这样只调用一次底层的 Write 系统调用，保证原子性，极大减少 UDS 碎片
+	buf := make([]byte, 5+len(data))
+
+	buf[0] = packetType
+	binary.BigEndian.PutUint32(buf[1:], length)
+
+	if len(data) > 0 {
+		copy(buf[5:], data)
 	}
-	// Write payload
-	if _, err := w.Write(data); err != nil {
+
+	// Write entire packet at once
+	if _, err := w.Write(buf); err != nil {
 		return err
 	}
 	return nil

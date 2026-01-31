@@ -17,9 +17,19 @@ type StartSessionPayload struct {
 }
 
 type ASRPayload struct {
-	Extra map[string]interface{} `json:"extra"`
+	AudioInfo *ASRAudioInfo          `json:"audio_info,omitempty"` // [新增]
+	Extra     map[string]interface{} `json:"extra"`
 }
-
+type ASRAudioInfo struct {
+	Format     string `json:"format"`      // "speech_opus"
+	SampleRate int    `json:"sample_rate"` // 16000
+	Channel    int    `json:"channel"`     // 1
+}
+type ChatResponsePayload struct {
+	Content    string `json:"content"`
+	QuestionID string `json:"question_id"`
+	ReplyID    string `json:"reply_id"`
+}
 type TTSPayload struct {
 	Speaker     string       `json:"speaker"`
 	AudioConfig *AudioConfig `json:"audio_config,omitempty"`
@@ -100,7 +110,6 @@ func startConnection(conn *websocket.Conn) error {
 		return fmt.Errorf("send StartConnection request: %w", err)
 	}
 
-	// Read ConnectionStarted message.
 	mt, frame, err := conn.ReadMessage()
 	if err != nil {
 		return fmt.Errorf("read ConnectionStarted response: %w", err)
@@ -128,12 +137,12 @@ func startConnection(conn *websocket.Conn) error {
 func startSession(conn *websocket.Conn, sessionID string, req *StartSessionPayload) error {
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal StartSession request payload: %w", err)
+		return fmt.Errorf("marshal StartSession payload: %w", err)
 	}
 
 	msg, err := NewMessage(MsgTypeFullClient, MsgTypeFlagWithEvent)
 	if err != nil {
-		return fmt.Errorf("create StartSession request message: %w", err)
+		return fmt.Errorf("create StartSession message: %w", err)
 	}
 	msg.Event = 100
 	msg.SessionID = sessionID
@@ -142,7 +151,7 @@ func startSession(conn *websocket.Conn, sessionID string, req *StartSessionPaylo
 	frame, err := protocol.Marshal(msg)
 	glog.Infof("StartSession request frame: %v", frame)
 	if err != nil {
-		return fmt.Errorf("marshal StartSession request message: %w", err)
+		return fmt.Errorf("marshal StartSession message: %w", err)
 	}
 
 	if err := sendRequest(conn, frame); err != nil {
@@ -158,7 +167,6 @@ func startSession(conn *websocket.Conn, sessionID string, req *StartSessionPaylo
 		return fmt.Errorf("unexpected Websocket message type: %d", mt)
 	}
 
-	// Validate SessionStarted message.
 	msg, _, err = Unmarshal(frame, protocol.containsSequence)
 	if err != nil {
 		glog.Infof("StartSession response: %s", frame)
@@ -168,17 +176,18 @@ func startSession(conn *websocket.Conn, sessionID string, req *StartSessionPaylo
 		return fmt.Errorf("unexpected SessionStarted message type: %s", msg.Type)
 	}
 	if msg.Event != 150 {
-		return fmt.Errorf("unexpected response event (%d) for StartSession request", msg.Event)
+		return fmt.Errorf("unexpected response event (%d) for StartSession", msg.Event)
 	}
 	glog.Infof("SessionStarted response payload: %v", string(msg.Payload))
 	var jsonData map[string]interface{}
-	if err := json.Unmarshal(msg.Payload, &jsonData); err != nil {
-		return fmt.Errorf("unmarshal SessionStarted response payload: %w", err)
+	if err := json.Unmarshal(msg.Payload, &jsonData); err == nil {
+		if did, ok := jsonData["dialog_id"].(string); ok {
+			dialogID = did
+		}
 	}
-	dialogID = jsonData["dialog_id"].(string)
+	glog.Infof("Session started, DialogID: %s", dialogID)
 	return nil
 }
-
 func sayHello(conn *websocket.Conn, sessionID string, req *SayHelloPayload) error {
 	payload, err := json.Marshal(req)
 	glog.Infof("SayHello request payload: %s", string(payload))
@@ -209,11 +218,11 @@ func sayHello(conn *websocket.Conn, sessionID string, req *SayHelloPayload) erro
 func chatTextQuery(conn *websocket.Conn, sessionID string, req *ChatTextQueryPayload) error {
 	payload, err := json.Marshal(req)
 	if err != nil {
-		return fmt.Errorf("marshal ChatTextQuery request payload: %w", err)
+		return fmt.Errorf("marshal ChatTextQuery payload: %w", err)
 	}
 	msg, err := NewMessage(MsgTypeFullClient, MsgTypeFlagWithEvent)
 	if err != nil {
-		return fmt.Errorf("create ChatTextQuery request message: %w", err)
+		return fmt.Errorf("create ChatTextQuery message: %w", err)
 	}
 	msg.Event = 501
 	msg.SessionID = sessionID
@@ -221,7 +230,7 @@ func chatTextQuery(conn *websocket.Conn, sessionID string, req *ChatTextQueryPay
 	frame, err := protocol.Marshal(msg)
 	glog.Infof("ChatTextQuery request frame: %v", frame)
 	if err != nil {
-		return fmt.Errorf("marshal ChatTextQuery request message: %w", err)
+		return fmt.Errorf("marshal ChatTextQuery message: %w", err)
 	}
 	if err := sendRequest(conn, frame); err != nil {
 		return fmt.Errorf("send ChatTextQuery request: %w", err)
@@ -299,9 +308,36 @@ func sendRequest(conn *websocket.Conn, frame []byte) error {
 	wsWriteLock.Lock()
 	defer wsWriteLock.Unlock()
 	if err := conn.WriteMessage(websocket.BinaryMessage, frame); err != nil {
-		// return fmt.Errorf("send SayHello request: %w", err) // Original err msg was wrong context
-		return fmt.Errorf("sendMessage error: %w", err)
+		return fmt.Errorf("ws write error: %w", err)
 	}
 	localSequence.Add(1)
+	return nil
+}
+
+// [新增] 发送音频数据 (Opus)
+func sendAudioData(conn *websocket.Conn, sessionID string, audioBytes []byte) error {
+	// MsgTypeAudioOnlyClient (0x20)
+	msg, err := NewMessage(MsgTypeAudioOnlyClient, MsgTypeFlagWithEvent)
+	if err != nil {
+		return fmt.Errorf("create audio message error: %w", err)
+	}
+
+	msg.Event = 200 // Event 200: TaskRequest (Audio Input)
+	msg.SessionID = sessionID
+	msg.Payload = audioBytes
+
+	// [重要] 音频数据必须使用 Raw 序列化，不能用 JSON
+	audioProtocol := protocol.Clone()
+	audioProtocol.SetSerialization(SerializationRaw)
+
+	frame, err := audioProtocol.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal audio frame error: %w", err)
+	}
+
+	if err := sendRequest(conn, frame); err != nil {
+		return fmt.Errorf("send audio frame error: %w", err)
+	}
+
 	return nil
 }

@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"log"
+	"reflect"
 	"time"
 
 	"infinite-live/internal/domain"
@@ -104,7 +105,7 @@ func (l *LiveInteractor) runAudioLoop() {
 			}
 
 			// 其次播放 Idle 音频
-			if l.idleAudioSource != nil {
+			if !IsNil(l.idleAudioSource) {
 				frame, err := l.idleAudioSource.NextFrame()
 				if err == nil {
 					l.publisher.Publish(frame)
@@ -112,6 +113,13 @@ func (l *LiveInteractor) runAudioLoop() {
 			}
 		}
 	}
+}
+func IsNil(x interface{}) bool {
+	if x == nil {
+		return true
+	}
+	rv := reflect.ValueOf(x)
+	return rv.Kind() == reflect.Ptr && rv.IsNil()
 }
 
 // 视频循环
@@ -145,7 +153,7 @@ func (l *LiveInteractor) runVideoLoop() {
 					if !talkFrame.IsKey {
 						// 如果这里打印了日志，说明 main.go 的关键帧过滤没生效
 						// 或者 VP8 数据流有问题
-						// log.Println("⚠️ Skipped P-Frame, waiting for Keyframe...")
+						log.Println("⚠️ Skipped P-Frame, waiting for Keyframe...")
 						continue
 					}
 					log.Println("✅ Talking Started (Keyframe Rendered)")

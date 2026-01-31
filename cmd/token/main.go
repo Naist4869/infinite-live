@@ -11,6 +11,8 @@ import (
 func main() {
 	apiKey := os.Getenv("LIVEKITAPIKEY")
 	apiSecret := os.Getenv("LIVEKITSECRET")
+	LiveKitURL := os.Getenv("LIVEKITURL")
+
 	roomName := "infinite-live-room"
 
 	at := auth.NewAccessToken(apiKey, apiSecret)
@@ -21,6 +23,6 @@ func main() {
 	at.AddGrant(grant).SetIdentity("viewer-test").SetValidFor(time.Hour * 24)
 
 	token, _ := at.ToJWT()
-	fmt.Println("LiveKit URL: ws://<你的服务器公网IP>:7880")
+	fmt.Println("LiveKit URL: ", LiveKitURL)
 	fmt.Println("Token:", token)
 }
