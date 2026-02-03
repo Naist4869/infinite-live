@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	uds_pkg "infinite-live/internal/pkg/protocol" // 请确保路径和你项目一致
@@ -16,7 +18,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -40,11 +41,10 @@ const (
 
 	// Video Gen Config
 	genAPI     = "http://192.168.50.56:8000/generate_stream"
-	localImage = "assets/share_5b8a5e532c2ae42359995de2f33b54a5~2.png"
+	localImage = "assets/Screenshot_20260202_140824.jpg"
 )
 
 var (
-	isSessionReady atomic.Bool
 	// [调试开关] true: 本地播放PCM, 不生成视频; false: 请求视频生成
 	DebugMode = false
 	// [新增调试开关] 是否保存 Worker 收到的音频为 OGG 文件
@@ -54,6 +54,16 @@ var (
 	s16Buffer  = make([]int16, 0, sampleRate*bufferSeconds)
 )
 
+// === 核心修改 1: 使用 Atomic Value 存储当前 Worker 的唯一 ID ===
+// 之前是 isSessionReady atomic.Bool
+var currentWorkerID atomic.Value // 存储 string
+
+// 辅助函数：判断是否就绪
+func isWorkerReady() bool {
+	val := currentWorkerID.Load()
+	return val != nil && val.(string) != ""
+}
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
@@ -62,17 +72,29 @@ var upgrader = websocket.Upgrader{
 var udsConn net.Conn
 var udsLock sync.Mutex
 
+// 指令通道 (HTTP -> Python)
+type WorkerCommand struct {
+	Type string `json:"type"`           // "task.text", "control.interrupt"
+	Text string `json:"text,omitempty"` // 文本内容
+	Mode string `json:"mode,omitempty"` // "chat" 或 "tts"
+}
+
 // 修改全局通道的类型
 var (
-	globalAudioChan = make(chan []byte, 10000)
+	globalAudioChan   = make(chan []byte, 10000)
+	globalCommandChan = make(chan WorkerCommand, 100)
 )
 
 func main() {
 	_ = flag.Set("logtostderr", "true")
 	flag.Parse()
-
-	// 1. Connect to UDS Server (渲染端)
+	// 初始化 currentWorkerID 为空字符串
+	currentWorkerID.Store("")
+	// 1. 连接 UDS
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	var err error
+
 	udsConn, err = net.Dial("unix", "/tmp/infinite-live.sock")
 	if err != nil {
 		log.Fatalf("Failed to connect to UDS: %v", err)
@@ -80,14 +102,7 @@ func main() {
 	defer udsConn.Close()
 	log.Println("✅ Connected to UDS Server")
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// 2. Start Local Session
-	go connectLocalServer(ctx)
-	// =================================================================
-	// 4. 生产者 A：UDS 读取循环 (LiveKit 音频源)
-	// =================================================================
+	// 2. 监听 UDS 音频输入
 	go func() {
 		log.Println("🎧 Listening for UDS packets...")
 		for {
@@ -100,27 +115,41 @@ func main() {
 				stop()
 				return
 			}
-
 			if pktType == uds_pkg.PacketTypeUserAudio && len(payload) > 0 {
-				if isSessionReady.Load() {
+				if isWorkerReady() {
 					globalAudioChan <- payload
 				}
-
 			}
 		}
 	}()
 
-	// 启动 HTTP 服务用于接收 Windows 音频
+	// 3. 注册路由
+	// WebSocket: 接收音频流 (Windows)
+	http.HandleFunc("/audio-stream", handleAudioStream)
+	// WebSocket: Python Worker 连接
+	http.HandleFunc("/worker/connect", func(w http.ResponseWriter, r *http.Request) {
+		handleWorkerConnection(ctx, w, r)
+	})
+	// HTTP API: 提交任务
+	http.HandleFunc("/task/chat", handleHttpTask("chat")) // 对话模式
+	http.HandleFunc("/task/tts", handleHttpTask("tts"))   // 直接TTS模式
+
+	log.Println("🚀 Central Controller listening on :8001")
+	log.Println("   👉 Audio Stream (WS): ws://localhost:8001/audio-stream")
+	log.Println("   👉 Worker Connect (WS): ws://localhost:8001/worker/connect")
+	log.Println("   👉 Chat API (POST): http://localhost:8001/task/chat Body: {\"text\": \"...\"}")
+	log.Println("   👉 TTS API (POST):  http://localhost:8001/task/tts  Body: {\"text\": \"...\"}")
+
+	srv := &http.Server{Addr: ":8001"}
 	go func() {
-		log.Println("🌐 Audio Ingest Server listening on :8001")
-		http.HandleFunc("/audio-stream", handleAudioStream)
-		if err := http.ListenAndServe(":8001", nil); err != nil {
-			log.Fatal("HTTP Server Error:", err)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP Server Error: %v", err)
 		}
 	}()
 
 	<-ctx.Done()
 	log.Println("👋 Shutting down...")
+	srv.Shutdown(context.Background())
 }
 
 // 处理来自 Windows 的 WebSocket 连接
@@ -139,10 +168,49 @@ func handleAudioStream(w http.ResponseWriter, r *http.Request) {
 			log.Println("Windows disconnected:", err)
 			break
 		}
-		if mt == websocket.BinaryMessage && len(message) > 0 {
-			if isSessionReady.Load() {
-				globalAudioChan <- message
-			}
+		if mt == websocket.BinaryMessage && len(message) > 0 && isWorkerReady() {
+			globalAudioChan <- message
+
+		}
+	}
+}
+
+// 通用任务处理函数 (Chat / TTS)
+func handleHttpTask(mode string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		type TaskRequest struct {
+			Text string `json:"text"`
+		}
+		var req TaskRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		if req.Text == "" {
+			http.Error(w, "Text is required", http.StatusBadRequest)
+			return
+		}
+
+		// 发送到指令通道
+		cmd := WorkerCommand{
+			Type: "task.text",
+			Text: req.Text,
+			Mode: mode,
+		}
+
+		// 非阻塞发送，防止通道满导致 HTTP 卡住
+		select {
+		case globalCommandChan <- cmd:
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"status": "ok", "mode": mode})
+		default:
+			http.Error(w, "System busy", http.StatusServiceUnavailable)
 		}
 	}
 }
@@ -151,159 +219,211 @@ func handleAudioStream(w http.ResponseWriter, r *http.Request) {
 //  [核心修改] 连接本地 Python Server (server.py)
 // ====================================================================================
 
-func connectLocalServer(ctx context.Context) {
-	// ---------------------------------------------------------
-	// 🐛 调试：初始化 OGG Writer
-	// ---------------------------------------------------------
-	var debugOggWriter *oggwriter.OggWriter
-	var rtpSeq uint16 = 0
-	var rtpTimestamp uint32 = 0
+// 处理 Python Worker 连接
+func handleWorkerConnection(appCtx context.Context, w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("Worker upgrade failed: %v", err)
+		return
+	}
 
-	if DebugSaveOgg {
-		log.Println("🐛 Debug Mode: Recording received audio to 'debug_worker_received.ogg'")
-		// 48000 是 Opus 的标准采样率，1 是通道数
-		writer, err := oggwriter.New("debug_worker_received.ogg", 48000, 1)
-		if err != nil {
-			log.Printf("❌ Failed to create debug ogg file: %v", err)
+	ctx, cancel := context.WithCancel(appCtx)
+	defer cancel() // 确保退出时释放
+
+	connRemoteAddr := conn.RemoteAddr().String()
+	log.Printf("🤖 Python Worker Connected! [%s]", connRemoteAddr)
+	// === 核心修改 3: 生成唯一 Session ID ===
+	// 使用时间戳+远程端口作为简易ID，足以区分不同连接
+	mySessionID := fmt.Sprintf("%d-%s", time.Now().UnixNano(), connRemoteAddr)
+
+	log.Printf("🤖 Python Worker Connected! [%s] ID: %s", connRemoteAddr, mySessionID)
+
+	// 标记为就绪
+	currentWorkerID.Store(mySessionID)
+
+	// 注册退出清理逻辑
+	defer func() {
+		conn.Close()
+		// === 核心修改 4: 只有当当前ID等于我的ID时，才置空 ===
+		// 这样防止旧连接退出时，把新连接的状态给冲掉了
+		if currentWorkerID.Load() == mySessionID {
+			currentWorkerID.Store("")
+			log.Printf("⚠️ Worker Disconnected [%s] (State Cleared)", connRemoteAddr)
 		} else {
+			log.Printf("⚠️ Worker Disconnected [%s] (State Preserved for New Worker)", connRemoteAddr)
+		}
+	}()
+	// === 核心修改 5: 心跳保活 (防止僵尸连接卡5分钟) ===
+	// 设置 ReadDeadline，如果 60秒 内没有收到任何消息（包括 Ping/Pong），则认为连接已死
+	// Python 端默认 ping_interval=20，所以这里设置 60 是安全的
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	// 设置 Ping 处理器：当收到 Python 发来的 Ping 时触发
+	conn.SetPingHandler(func(appData string) error {
+		log.Println("收到客户端 Ping，延长连接时间")
+		// 延长 ReadDeadline
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// 必须手动回复 Pong（或者调用默认 handler）
+		// 简单做法是调用 WriteControl 回复 Pong，或者直接返回 nil
+		// 注意：gorilla 的默认 PingHandler 会自动回 Pong，
+		// 但如果我们覆盖了它，就需要确保 Pong 被发送，或者仅仅做延时处理。
+		// 标准做法如下：
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+		if err == nil {
+			return nil
+		}
+		return err
+	})
+	if DebugMode {
+		go startPlayer(ctx)
+	}
+
+	// OGG Debug Writer (略去详细实现，保持原样)
+	var debugOggWriter *oggwriter.OggWriter
+	if DebugSaveOgg {
+		writer, _ := oggwriter.New("debug_worker_sent.ogg", 48000, 1)
+		if writer != nil {
 			debugOggWriter = writer
 			defer writer.Close()
 		}
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-		log.Printf("🔌 Connecting to Local Server: %s ...", LocalWSHost)
-		conn, _, err := websocket.DefaultDialer.Dial(LocalWSHost, nil)
-		if err != nil {
-			log.Printf("❌ Connect failed: %v, retrying in 3s...", err)
-			time.Sleep(3 * time.Second)
-			continue
-		}
+	// --- A. 发送协程 (Go -> Python) ---
+	go func() {
+		defer wg.Done()
+		defer conn.Close()
+		var rtpSeq uint16 = 0
+		var rtpTimestamp uint32 = 0
 
-		log.Println("✅ Connected to Local Brain (ASR/LLM/TTS)!")
-		isSessionReady.Store(true)
-
-		if DebugMode {
-			go startPlayer(ctx)
-		}
-
-		var wg sync.WaitGroup
-		wg.Add(2)
-
-		// ---------------------------------------------------------
-		// 1. 发送协程: globalAudioChan -> Python
-		// ---------------------------------------------------------
-		go func() {
-			defer wg.Done()
-			defer conn.Close()
-			for {
-				select {
-				case <-ctx.Done():
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			// 1. 发送音频
+			case audioData := <-globalAudioChan:
+				if len(audioData) < 4 {
+					continue
+				}
+				if debugOggWriter != nil {
+					pkt := &rtp.Packet{
+						Header:  rtp.Header{Version: 2, PayloadType: 111, SequenceNumber: rtpSeq, Timestamp: rtpTimestamp, SSRC: 12345},
+						Payload: audioData,
+					}
+					debugOggWriter.WriteRTP(pkt)
+					rtpSeq++
+					rtpTimestamp += 960
+				}
+				if err := conn.WriteMessage(websocket.BinaryMessage, audioData); err != nil {
 					return
-				case dataToSend := <-globalAudioChan:
-					// 这里不能把全部的opus流转发 因为消费端处理速度不够 所以要截断一些杂音匹配速度
-					if len(dataToSend) < 4 {
-						continue
-					}
-
-					// -------------------------------------------------
-					// 🐛 调试：写入 OGG 文件
-					// -------------------------------------------------
-					if debugOggWriter != nil {
-						// 我们需要构造一个假的 RTP 包，因为 OGG Writer 需要它
-						// Opus 帧通常是 20ms，对应 48000 * 0.02 = 960 个采样点
-						pkt := &rtp.Packet{
-							Header: rtp.Header{
-								Version:        2,
-								PayloadType:    111, // Opus dynamic payload type
-								SequenceNumber: rtpSeq,
-								Timestamp:      rtpTimestamp,
-								SSRC:           12345,
-							},
-							Payload: dataToSend,
-						}
-
-						if err := debugOggWriter.WriteRTP(pkt); err != nil {
-							log.Printf("Debug write error: %v", err)
-						}
-
-						// 递增计数器 (模拟正常的时间流逝)
-						rtpSeq++
-						rtpTimestamp += 960
-					}
-
-					// 发送给 Python
-					if err := conn.WriteMessage(websocket.BinaryMessage, dataToSend); err != nil {
-						log.Printf("WS Write Error: %v", err)
-						return
-					}
+				}
+			// 2. 发送指令
+			case cmd := <-globalCommandChan:
+				log.Printf("📤 Command -> Worker: [%s] %s", cmd.Mode, cmd.Text)
+				if err := conn.WriteJSON(cmd); err != nil {
+					return
 				}
 			}
-		}()
+		}
+	}()
 
-		// ---------------------------------------------------------
-		// 2. 接收协程 (保持不变)
-		// ---------------------------------------------------------
-		go func() {
-			defer wg.Done()
-			defer conn.Close()
-			var audioBuf bytes.Buffer
-			var currentAction string = "说话"
+	// --- B. 接收协程 (Python -> Go) ---
+	go func() {
+		defer wg.Done()
+		defer conn.Close()
 
-			for {
-				mt, message, err := conn.ReadMessage()
-				if err != nil {
-					log.Printf("WS Read Error: %v", err)
-					return
+		type WorkerResponse struct {
+			Type   string `json:"type"`
+			Delta  string `json:"delta,omitempty"` // Base64 Audio
+			Text   string `json:"text,omitempty"`
+			Action string `json:"action,omitempty"`
+		}
+
+		var audioBuf bytes.Buffer
+		var currentAction string = "说话" // 默认动作
+
+		for {
+			mt, message, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("❌ Worker Read Error: %v", err)
+				return
+			}
+			// 收到任何消息都刷新 Deadline
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			if mt == websocket.TextMessage {
+				var resp WorkerResponse
+				if err := json.Unmarshal(message, &resp); err != nil {
+					log.Printf("⚠️ Invalid JSON from worker: %v", err)
+					continue
 				}
 
-				if mt == websocket.TextMessage {
-					text := string(message)
-					if strings.HasPrefix(text, "ACTION:") {
-						currentAction = text[7:]
-						log.Printf("🎬 [Action] %s", currentAction)
-					} else if strings.HasPrefix(text, "TEXT:") {
-						log.Printf("🤖 AI: %s", text[5:])
-					} else if text == "CONTROL:INTERRUPT" {
-						log.Println("🛑 Interrupted!")
-						audioBuf.Reset()
-						currentAction = "说话"
-					} else if text == "CONTROL:TTS_END" {
+				switch resp.Type {
+				case "worker.register":
+					log.Println("✅ Worker Registered Capabilities.")
+
+				case "worker.detected_speech":
+					log.Println("\n🛑 User started speaking (Interrupting...)")
+					audioBuf.Reset()
+					// 可以在这里通知前端停止播放
+
+				case "response.text.ai":
+					fmt.Printf("\n🤖 AI: %s\n", resp.Text)
+
+				case "response.action":
+					currentAction = resp.Action
+					fmt.Printf("🎬 Action: %s\n", currentAction)
+
+				case "response.audio.delta":
+					// 1. 进度条 (打印点)
+					fmt.Print(".")
+
+					// 2. 解码 Base64 -> Binary
+					if resp.Delta != "" {
+						decoded, err := base64.StdEncoding.DecodeString(resp.Delta)
+						if err != nil {
+							log.Printf("❌ Base64 Decode Error: %v", err)
+							continue
+						}
+
+						audioBuf.Write(decoded) // 存入 Buffer 等待生成视频
+
+					}
+
+				case "response.done":
+					// 进度条结束换行
+					fmt.Println("\n✅ Generation Done.")
+
+					log.Printf("🚀 Trigger Video Gen | Prompt: %s | AudioSize: %d", currentAction, audioBuf.Len())
+
+					if audioBuf.Len() > 0 {
+						finalAudio := make([]byte, audioBuf.Len())
+						copy(finalAudio, audioBuf.Bytes())
 						if DebugMode {
-							log.Println("🔊 TTS End (Local Debug).")
+							handleIncomingAudio(finalAudio) // 本地播放
+
 						} else {
-							log.Printf("🚀 Trigger Gen | Prompt: %s", currentAction)
-							finalAudio := make([]byte, audioBuf.Len())
-							copy(finalAudio, audioBuf.Bytes())
+
 							go func(p string, a []byte) {
 								if err := generateAndStream(p, a); err != nil {
 									log.Printf("❌ Gen Failed: %v", err)
 								}
 							}(currentAction, finalAudio)
 						}
-						audioBuf.Reset()
-						currentAction = "说话"
+						// 异步调用视频生成
+
 					}
-				} else if mt == websocket.BinaryMessage {
-					if DebugMode {
-						handleIncomingAudio(message)
-					} else {
-						audioBuf.Write(message)
-					}
+
+					// 重置状态
+					audioBuf.Reset()
+					currentAction = "说话"
 				}
 			}
-		}()
+		}
+	}()
 
-		wg.Wait()
-		isSessionReady.Store(false)
-		log.Println("⚠️ Connection lost, reconnecting...")
-	}
+	wg.Wait()
+	log.Println("⚠️ Worker Disconnected.")
 }
 
 // ====================================================================================
@@ -591,41 +711,106 @@ func generateAndStream(prompt string, audioData []byte) error {
 // -----------------------------------------------------------------------------
 
 func startPlayer(ctx context.Context) {
-	cmd := exec.Command("ffplay.exe",
-		"-f", "s16le", "-ar", "24000", "-ac", "1",
-		"-nodisp", "-probesize", "32", "-analyzeduration", "0",
-		"-fflags", "nobuffer", "-flags", "low_delay", "-i", "pipe:0")
-	stdin, _ := cmd.StdinPipe()
-	cmd.Start()
+	// 1. 确保使用绝对路径或系统能找到 ffplay.exe
+	// WSL 能够直接运行 Path 中的 .exe，但建议检查一下
+	path, err := exec.LookPath("ffplay.exe")
+	if err != nil {
+		fmt.Println("Error: ffplay.exe not found. Make sure ffmpeg/bin is in your Windows Path.")
+		return
+	}
+
+	cmd := exec.Command(path,
+		"-f", "s16le", // 格式
+		"-ar", "24000", // 采样率
+		"-ch_layout", "mono", // ✅ 修正点1：使用新版参数 -ch_layout mono 代替 -ac 1
+		"-nodisp",          // 无窗口
+		"-probesize", "32", // 低延迟优化
+		"-analyzeduration", "0",
+		"-fflags", "nobuffer",
+		"-flags", "low_delay",
+		// "-ac", "1",       // 如果 -ch_layout 依然不行，可以解开这行注释，但前提是必须删掉 -i
+		"-", // ✅ 修正点2：使用 "-" 代表标准输入，比 "pipe:0" 在某些shell下更兼容，且绝对不能加 "-i"
+	)
+
+	// 2. 【关键】接管标准错误输出，否则 ffplay 报错你看不到
+	cmd.Stderr = os.Stderr
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		fmt.Println("Error creating stdin pipe:", err)
+		return
+	}
+
+	// 3. 启动命令
+	if err := cmd.Start(); err != nil {
+		fmt.Println("Error starting ffplay:", err)
+		return
+	}
+
+	// 预先写入一点静音数据，防止 ffplay 启动初期因为没数据而立即退出或卡住
 	go func() {
-		silence := make([]byte, 24000*2)
-		stdin.Write(silence)
+		silence := make([]byte, 24000*2) // 1秒静音
+		_, err := stdin.Write(silence)
+		if err != nil {
+			// 如果这里报错，说明 ffplay 可能已经退出了
+			fmt.Println("Error writing silence:", err)
+		}
 	}()
-	go cmd.Wait()
+
+	// 监听进程退出
+	go func() {
+		err := cmd.Wait()
+		fmt.Println("ffplay exited:", err)
+	}()
+
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
+
+	// 缓冲区复用
 	buf := make([]byte, 4096)
+
 	for {
 		select {
 		case <-ctx.Done():
 			stdin.Close()
+			// 最好显式杀掉进程，防止僵尸进程
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
 			return
 		case <-ticker.C:
 			bufferLock.Lock()
+			// 4. 检查是否有数据
 			if len(s16Buffer) > 0 {
 				needed := len(s16Buffer) * 2
 				if cap(buf) < needed {
 					buf = make([]byte, needed)
 				}
 				data := buf[:needed]
+
+				// 转换 int16 slice 到 byte slice (Little Endian)
 				for i, s := range s16Buffer {
 					data[i*2] = byte(s & 0xff)
 					data[i*2+1] = byte((s >> 8) & 0xff)
 				}
+
+				// 清空缓冲区
 				s16Buffer = s16Buffer[:0]
-				stdin.Write(data)
+
+				// 解锁必须在 Write 之前吗？
+				// 如果 Write 阻塞，会锁死生成端。
+				// 建议先拷贝数据，解锁，再 Write。
+				bufferLock.Unlock()
+
+				// 写入数据到 ffplay
+				_, err := stdin.Write(data)
+				if err != nil {
+					fmt.Println("Error writing audio data:", err)
+					return // 管道破裂，退出循环
+				}
+			} else {
+				bufferLock.Unlock()
 			}
-			bufferLock.Unlock()
 		}
 	}
 }
